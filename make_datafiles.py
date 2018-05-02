@@ -186,7 +186,7 @@ def write_to_tar(url_file, out_file, makevocab=False):
             js_example['id'] = s.replace('.story', '')
             js_example['article'] = article_sents
             js_example['abstract'] = abstract_sents
-            js_serialized = json.dumps(js_example).encode()
+            js_serialized = json.dumps(js_example, indent=4).encode()
             save_file = io.BytesIO(js_serialized)
             tar_info = tarfile.TarInfo('{}/{}.json'.format(
                 os.path.basename(out_file).replace('.tar', ''), idx))
