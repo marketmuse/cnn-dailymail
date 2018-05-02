@@ -1,22 +1,20 @@
 import sys
 import os
 import hashlib
-import struct
 import subprocess
 import collections
-import tensorflow as tf
-from tensorflow.core.example import example_pb2
+
+import json
+import tarfile
+import io
+import pickle as pkl
 
 
-dm_single_close_quote = u'\u2019' # unicode
-dm_double_close_quote = u'\u201d'
+dm_single_close_quote = '\u2019' # unicode
+dm_double_close_quote = '\u201d'
 # acceptable ways to end a sentence
 END_TOKENS = ['.', '!', '?', '...', "'", "`", '"',
               dm_single_close_quote, dm_double_close_quote, ")"]
-
-# We use these to separate the summary sentences in the .bin datafiles
-SENTENCE_START = '<s>'
-SENTENCE_END = '</s>'
 
 all_train_urls = "url_lists/all_train.txt"
 all_val_urls = "url_lists/all_val.txt"
@@ -25,48 +23,11 @@ all_test_urls = "url_lists/all_test.txt"
 cnn_tokenized_stories_dir = "cnn_stories_tokenized"
 dm_tokenized_stories_dir = "dm_stories_tokenized"
 finished_files_dir = "finished_files"
-chunks_dir = os.path.join(finished_files_dir, "chunked")
 
 # These are the number of .story files we expect there to be in cnn_stories_dir
 # and dm_stories_dir
 num_expected_cnn_stories = 92579
 num_expected_dm_stories = 219506
-
-VOCAB_SIZE = 200000
-CHUNK_SIZE = 1000 # num examples per chunk, for the chunked data
-
-
-def chunk_file(set_name):
-    in_file = 'finished_files/{}.bin'.format(set_name)
-    reader = open(in_file, "rb")
-    chunk = 0
-    finished = False
-    while not finished:
-        chunk_fname = os.path.join(
-            chunks_dir, '{}_{:03d}.bin'.format(set_name, chunk)) # new chunk
-        with open(chunk_fname, 'wb') as writer:
-            for _ in range(CHUNK_SIZE):
-                len_bytes = reader.read(8)
-                if not len_bytes:
-                    finished = True
-                    break
-                str_len = struct.unpack('q', len_bytes)[0]
-                example_str = struct.unpack(
-                    '{}s'.format(str_len), reader.read(str_len))[0]
-                writer.write(struct.pack('q', str_len))
-                writer.write(struct.pack('{}s'.format(str_len), example_str))
-            chunk += 1
-
-
-def chunk_all():
-    # Make a dir to hold the chunks
-    if not os.path.isdir(chunks_dir):
-        os.mkdir(chunks_dir)
-    # Chunk the data
-    for set_name in ['train', 'val', 'test']:
-        print("Splitting {} data into chunks...".format(set_name))
-        chunk_file(set_name)
-    print("Saved chunked data in {}".format(chunks_dir))
 
 
 def tokenize_stories(stories_dir, tokenized_stories_dir):
@@ -109,11 +70,12 @@ def tokenize_stories(stories_dir, tokenized_stories_dir):
         stories_dir, tokenized_stories_dir))
 
 
-def read_text_file(text_file):
-    lines = []
+def read_story_file(text_file):
     with open(text_file, "r") as f:
-        for line in f:
-            lines.append(line.strip())
+        # sentences are separated by 2 newlines
+        # single newlines might be image captions
+        # so will be incomplete sentence
+        lines = f.read().split('\n\n')
     return lines
 
 
@@ -136,15 +98,15 @@ def fix_missing_period(line):
         return line
     if line[-1] in END_TOKENS:
         return line
-    # print line[-1]
     return line + " ."
 
 
 def get_art_abs(story_file):
-    lines = read_text_file(story_file)
+    """ return as list of sentences"""
+    lines = read_story_file(story_file)
 
-    # Lowercase everything
-    lines = [line.lower() for line in lines]
+    # Lowercase, truncated trailing spaces, and normalize spaces
+    lines = [' '.join(line.lower().strip().split()) for line in lines]
 
     # Put periods on the ends of lines that are missing them (this is a problem
     # in the dataset because many image captions don't end in periods;
@@ -165,23 +127,15 @@ def get_art_abs(story_file):
         else:
             article_lines.append(line)
 
-    # Make article into a single string
-    article = ' '.join(article_lines)
-
-    # Make abstract into a signle string,
-    # putting <s> and </s> tags around the sentences
-    abstract = ' '.join(["{} {} {}".format(SENTENCE_START, sent, SENTENCE_END)
-                         for sent in highlights])
-
-    return article, abstract
+    return article_lines, highlights
 
 
-def write_to_bin(url_file, out_file, makevocab=False):
+def write_to_tar(url_file, out_file, makevocab=False):
     """Reads the tokenized .story files corresponding to the urls listed in the
        url_file and writes them to a out_file.
     """
     print("Making bin file for URLs listed in {}...".format(url_file))
-    url_list = read_text_file(url_file)
+    url_list = [line.strip() for line in open(url_file)]
     url_hashes = get_url_hashes(url_list)
     story_fnames = [s+".story" for s in url_hashes]
     num_stories = len(story_fnames)
@@ -189,7 +143,7 @@ def write_to_bin(url_file, out_file, makevocab=False):
     if makevocab:
         vocab_counter = collections.Counter()
 
-    with open(out_file, 'wb') as writer:
+    with tarfile.open(out_file, 'w') as writer:
         for idx, s in enumerate(story_fnames):
             if idx % 1000 == 0:
                 print("Writing story {} of {}; {:.2f} percent done".format(
@@ -225,27 +179,24 @@ def write_to_bin(url_file, out_file, makevocab=False):
                 )
 
             # Get the strings to write to .bin file
-            article, abstract = get_art_abs(story_file)
+            article_sents, abstract_sents = get_art_abs(story_file)
 
-            # FIXME
-            # Write to tf.Example
-            tf_example = example_pb2.Example()
-            tf_example.features.feature['article'].bytes_list.value.extend(
-                [article])
-            tf_example.features.feature['abstract'].bytes_list.value.extend(
-                [abstract])
-            tf_example_str = tf_example.SerializeToString()
-            str_len = len(tf_example_str)
-            writer.write(struct.pack('q', str_len))
-            writer.write(struct.pack('{}s'.format(str_len), tf_example_str))
+            # Write to JSON file
+            js_example = {}
+            js_example['id'] = s.replace('.story', '')
+            js_example['article'] = article_sents
+            js_example['abstract'] = abstract_sents
+            js_serialized = json.dumps(js_example).encode()
+            save_file = io.BytesIO(js_serialized)
+            tar_info = tarfile.TarInfo('{}/{}.json'.format(
+                os.path.basename(out_file).replace('.tar', ''), idx))
+            tar_info.size = len(js_serialized)
+            writer.addfile(tar_info, save_file)
 
             # Write the vocab to file, if applicable
             if makevocab:
-                art_tokens = article.split(' ')
-                abs_tokens = abstract.split(' ')
-                abs_tokens = [t for t in abs_tokens
-                              if t not in [SENTENCE_START, SENTENCE_END]]
-                                  # remove these tags from vocab
+                art_tokens = ' '.join(article_sents).split()
+                abs_tokens = ' '.join(abstract_sents).split()
                 tokens = art_tokens + abs_tokens
                 tokens = [t.strip() for t in tokens] # strip
                 tokens = [t for t in tokens if t != ""] # remove empty
@@ -256,9 +207,9 @@ def write_to_bin(url_file, out_file, makevocab=False):
     # write vocab to file
     if makevocab:
         print("Writing vocab file...")
-        with open(os.path.join(finished_files_dir, "vocab"), 'w') as writer:
-            for word, count in vocab_counter.most_common(VOCAB_SIZE):
-                writer.write(word + ' ' + str(count) + '\n')
+        with open(os.path.join(finished_files_dir, "vocab_cnt.pkl"),
+                  'wb') as vocab_file:
+            pkl.dump(vocab_counter, vocab_file)
         print("Finished writing vocab file")
 
 
@@ -299,12 +250,7 @@ if __name__ == '__main__':
 
     # Read the tokenized stories, do a little postprocessing
     # then write to bin files
-    write_to_bin(all_test_urls, os.path.join(finished_files_dir, "test.bin"))
-    write_to_bin(all_val_urls, os.path.join(finished_files_dir, "val.bin"))
-    write_to_bin(all_train_urls, os.path.join(finished_files_dir, "train.bin"),
+    write_to_tar(all_test_urls, os.path.join(finished_files_dir, "test.tar"))
+    write_to_tar(all_val_urls, os.path.join(finished_files_dir, "val.tar"))
+    write_to_tar(all_train_urls, os.path.join(finished_files_dir, "train.tar"),
                  makevocab=True)
-
-    # Chunk the data. This splits each of train.bin, val.bin and test.bin into
-    # smaller chunks, each containing e.g. 1000 examples, and saves them in
-    # finished_files/chunks
-    chunk_all()
