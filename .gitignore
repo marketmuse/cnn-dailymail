@@ -5,3 +5,9 @@ __pycache__/
 
 # mypy
 .mypy_cache/
+
+# data
+finished_files/*
+dm_stories_tokenized/*
+cnn_stories_tokenized/*
+
